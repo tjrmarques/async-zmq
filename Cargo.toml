@@ -20,7 +20,7 @@ repository = "https://github.com/rdelfin/async-zmq"
 documentation = "https://docs.rs/async-zmq"
 
 [dependencies]
-mio = "0.6"
+mio = { version = "1.0", features = ["os-ext"] }
 zmq = "0.10"
 futures = "0.3"
 slab = "0.4"

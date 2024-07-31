@@ -1,5 +1,5 @@
 //! Socket type registered in async-std reactor
-pub(crate) mod evented;
+pub(crate) mod source;
 mod watcher;
 
 use crate::socket::{Multipart, MultipartIter};
@@ -16,7 +16,7 @@ pub trait AsRawSocket {
     fn as_socket(&self) -> &zmq::Socket;
 }
 
-pub(crate) type ZmqSocket = Watcher<evented::ZmqSocket>;
+pub(crate) type ZmqSocket = Watcher<source::ZmqSocket>;
 
 impl ZmqSocket {
     fn poll_event(&self, event: zmq::PollEvents) -> Result<(), io::Error> {
@@ -75,7 +75,7 @@ impl ZmqSocket {
 
 impl From<zmq::Socket> for ZmqSocket {
     fn from(socket: zmq::Socket) -> Self {
-        Watcher::new(evented::ZmqSocket(socket))
+        Watcher::new(source::ZmqSocket(socket))
     }
 }
 
