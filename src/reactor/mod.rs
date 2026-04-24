@@ -75,12 +75,12 @@ impl ZmqSocket {
 
 impl From<zmq::Socket> for ZmqSocket {
     fn from(socket: zmq::Socket) -> Self {
-        Watcher::new(source::ZmqSocket(socket))
+        Watcher::new(source::ZmqSocket::new(socket))
     }
 }
 
 impl AsRawSocket for ZmqSocket {
     fn as_socket(&self) -> &zmq::Socket {
-        &self.get_ref().0
+        &self.get_ref().socket
     }
 }
