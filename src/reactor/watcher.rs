@@ -1,20 +1,51 @@
-// TODO: async-std doesn't expose watcher at the moment. Remove this file. once our events are able to add to register.
+// TODO: remove this file once an executor-native fast path lands.
 #![allow(dead_code)]
-use std::fmt;
-use std::sync::{Arc, Mutex};
 
-use mio::{self, Evented};
-use once_cell::sync::Lazy;
+use std::fmt;
+use std::io;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll, Waker};
+
+use polling::{Event, Events, Poller};
 use slab::Slab;
 
-use std::io;
-use std::task::{Context, Poll, Waker};
+#[cfg(unix)]
+use std::os::fd::{BorrowedFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{BorrowedSocket, RawSocket};
+
+#[cfg(unix)]
+type RawHandle = RawFd;
+#[cfg(windows)]
+type RawHandle = RawSocket;
+
+/// Borrow the platform-specific raw handle for use with `polling::Poller`.
+///
+/// SAFETY: caller must guarantee that `raw` refers to an open SOCKET that
+/// outlives the borrow. In our reactor this holds because `ZmqSocket::Drop`
+/// calls `Reactor::deregister` while still holding `zmq::Socket` (and hence
+/// the SOCKET) — see field declaration order + explicit `Drop` on `ZmqSocket`.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+unsafe fn borrow(raw: RawHandle) -> BorrowedFd<'static> {
+    // SAFETY: forwarded from caller's contract.
+    unsafe { BorrowedFd::borrow_raw(raw) }
+}
+#[cfg(windows)]
+#[allow(unsafe_code)]
+unsafe fn borrow(raw: RawHandle) -> BorrowedSocket<'static> {
+    // SAFETY: forwarded from caller's contract.
+    unsafe { BorrowedSocket::borrow_raw(raw) }
+}
 
 /// Data associated with a registered I/O handle.
 #[derive(Debug)]
 struct Entry {
-    /// A unique identifier.
-    token: mio::Token,
+    /// Slab key (also the polling event key).
+    key: usize,
+
+    /// Raw underlying handle (FD on Unix, SOCKET on Windows).
+    raw: RawHandle,
 
     /// Tasks that are blocked on reading from this I/O handle.
     readers: Mutex<Readers>,
@@ -27,7 +58,7 @@ struct Entry {
 #[derive(Debug)]
 struct Readers {
     /// Flag indicating read readiness.
-    /// (cf. `Watcher::poll_read_ready`)
+    /// (cf. `ZmqSocket::poll_read_ready`)
     ready: bool,
     /// The `Waker`s blocked on reading.
     wakers: Vec<Waker>,
@@ -37,58 +68,54 @@ struct Readers {
 #[derive(Debug)]
 struct Writers {
     /// Flag indicating write readiness.
-    /// (cf. `Watcher::poll_write_ready`)
+    /// (cf. `ZmqSocket::poll_write_ready`)
     ready: bool,
     /// The `Waker`s blocked on writing.
     wakers: Vec<Waker>,
 }
 
-/// The state of a networking driver.
+/// The state of the global networking driver.
 struct Reactor {
-    /// A mio instance that polls for new events.
-    poller: mio::Poll,
+    /// A `polling` instance that polls for new events.
+    poller: Poller,
 
     /// A collection of registered I/O handles.
     entries: Mutex<Slab<Arc<Entry>>>,
-
-    /// Dummy I/O handle that is only used to wake up the polling thread.
-    notify_reg: (mio::Registration, mio::SetReadiness),
-
-    /// An identifier for the notification handle.
-    notify_token: mio::Token,
 }
 
 impl Reactor {
-    /// Creates a new reactor for polling I/O events.
-    fn new() -> io::Result<Reactor> {
-        let poller = mio::Poll::new()?;
-        let notify_reg = mio::Registration::new2();
-
-        let mut reactor = Reactor {
-            poller,
-            entries: Mutex::new(Slab::new()),
-            notify_reg,
-            notify_token: mio::Token(0),
-        };
-
-        // Register a dummy I/O handle for waking up the polling thread.
-        let entry = reactor.register(&reactor.notify_reg.0)?;
-        reactor.notify_token = entry.token;
-
-        Ok(reactor)
+    /// Returns the global reactor, lazily starting it on first use.
+    fn get() -> &'static Self {
+        static REACTOR: OnceLock<Reactor> = OnceLock::new();
+        REACTOR.get_or_init(|| {
+            let reactor = Reactor {
+                poller: Poller::new().expect("cannot create poller"),
+                entries: Mutex::new(Slab::new()),
+            };
+            std::thread::Builder::new()
+                .name("async-zmq/reactor".to_string())
+                .spawn(main_loop)
+                .expect("cannot start reactor thread");
+            reactor
+        })
     }
 
-    /// Registers an I/O event source and returns its associated entry.
-    fn register(&self, source: &dyn Evented) -> io::Result<Arc<Entry>> {
+    /// Registers an open SOCKET with the poller in default `Oneshot` mode
+    /// (the only mode supported by all backends, including Windows IOCP/AFD).
+    ///
+    /// SAFETY: caller MUST call `deregister` (via `ZmqSocket::Drop`) before
+    /// the SOCKET is closed.
+    #[allow(unsafe_code)]
+    unsafe fn register(&self, raw: RawHandle) -> io::Result<Arc<Entry>> {
         let mut entries = self.entries.lock().unwrap();
 
-        // Reserve a vacant spot in the slab and use its key as the token value.
+        // Reserve a vacant spot in the slab and use its key as the event key.
         let vacant = entries.vacant_entry();
-        let token = mio::Token(vacant.key());
+        let key = vacant.key();
 
-        // Allocate an entry and insert it into the slab.
         let entry = Arc::new(Entry {
-            token,
+            key,
+            raw,
             readers: Mutex::new(Readers {
                 ready: false,
                 wakers: Vec::new(),
@@ -100,123 +127,124 @@ impl Reactor {
         });
         vacant.insert(entry.clone());
 
-        // Register the I/O event source in the poller.
-        let interest = mio::Ready::all();
-        let opts = mio::PollOpt::edge();
-        self.poller.register(source, token, interest, opts)?;
+        // SAFETY: per method-level safety contract — caller guarantees the
+        // SOCKET stays open until `deregister`. `Poller::add` accepts the
+        // raw handle directly via the `AsRawSource for RawFd/RawSocket` impl.
+        unsafe {
+            self.poller.add(raw, Event::all(key))?;
+        }
 
         Ok(entry)
     }
 
     /// Deregisters an I/O event source associated with an entry.
-    fn deregister(&self, source: &dyn Evented, entry: &Entry) -> io::Result<()> {
-        // Deregister the I/O object from the mio instance.
-        self.poller.deregister(source)?;
+    fn deregister(&self, entry: &Entry) -> io::Result<()> {
+        // SAFETY: borrow lifetime ends in this call; `raw` is still valid
+        // because `ZmqSocket::Drop` runs `deregister` BEFORE the
+        // `zmq::Socket` field drops (which is what closes the SOCKET).
+        #[allow(unsafe_code)]
+        unsafe {
+            self.poller.delete(borrow(entry.raw))?;
+        }
 
         // Remove the entry associated with the I/O object.
-        self.entries.lock().unwrap().remove(entry.token.0);
+        self.entries.lock().unwrap().remove(entry.key);
 
         Ok(())
     }
-
-    // fn notify(&self) {
-    //     self.notify_reg
-    //         .1
-    //         .set_readiness(mio::Ready::readable())
-    //         .unwrap();
-    // }
 }
 
-/// The state of the global networking driver.
-static REACTOR: Lazy<Reactor> = Lazy::new(|| {
-    // Spawn a thread that waits on the poller for new events and wakes up tasks blocked on I/O
-    // handles.
-    std::thread::Builder::new()
-        .name("async-std/net".to_string())
-        .spawn(move || {
-            main_loop().expect("async networking thread has panicked");
-        })
-        .expect("cannot start a thread driving blocking tasks");
-
-    Reactor::new().expect("cannot initialize reactor")
-});
-
 /// Waits on the poller for new events and wakes up tasks blocked on I/O handles.
-fn main_loop() -> io::Result<()> {
-    let reactor = &REACTOR;
-    let mut events = mio::Events::with_capacity(1000);
+fn main_loop() {
+    let reactor = Reactor::get();
+    let mut events = Events::new();
 
     loop {
+        events.clear();
         // Block on the poller until at least one new event comes in.
-        reactor.poller.poll(&mut events, None)?;
+        if reactor.poller.wait(&mut events, None).is_err() {
+            continue;
+        }
 
         // Lock the entire entry table while we're processing new events.
+        // Holding this lock also blocks `ZmqSocket::Drop`, which guarantees
+        // that any `raw` we re-arm below still refers to an open SOCKET.
         let entries = reactor.entries.lock().unwrap();
 
-        for event in events.iter() {
-            let token = event.token();
-
-            if token == reactor.notify_token {
-                // If this is the notification token, we just need the notification state.
-                reactor.notify_reg.1.set_readiness(mio::Ready::empty())?;
-            } else {
-                // Otherwise, look for the entry associated with this token.
-                if let Some(entry) = entries.get(token.0) {
-                    // Set the readiness flags from this I/O event.
-                    let readiness = event.readiness();
-
-                    // Wake up reader tasks blocked on this I/O handle.
-                    if !(readiness & reader_interests()).is_empty() {
-                        let mut readers = entry.readers.lock().unwrap();
-                        readers.ready = true;
-                        for w in readers.wakers.drain(..) {
-                            w.wake();
-                        }
-                    }
-
-                    // Wake up writer tasks blocked on this I/O handle.
-                    if !(readiness & writer_interests()).is_empty() {
-                        let mut writers = entry.writers.lock().unwrap();
-                        writers.ready = true;
-                        for w in writers.wakers.drain(..) {
-                            w.wake();
-                        }
+        for ev in events.iter() {
+            if let Some(entry) = entries.get(ev.key) {
+                // Wake up reader tasks blocked on this I/O handle.
+                if ev.readable {
+                    let mut readers = entry.readers.lock().unwrap();
+                    readers.ready = true;
+                    for w in readers.wakers.drain(..) {
+                        w.wake();
                     }
                 }
+
+                // Wake up writer tasks blocked on this I/O handle.
+                if ev.writable {
+                    let mut writers = entry.writers.lock().unwrap();
+                    writers.ready = true;
+                    for w in writers.wakers.drain(..) {
+                        w.wake();
+                    }
+                }
+
+                // Re-arm: oneshot fires only once per registration.
+                // SAFETY: the entry is still in the slab and the SOCKET is
+                // still open because `ZmqSocket::Drop` is blocked on the
+                // outer `entries` lock we hold here.
+                #[allow(unsafe_code)]
+                let _ = unsafe {
+                    reactor
+                        .poller
+                        .modify(borrow(entry.raw), Event::all(entry.key))
+                };
             }
         }
     }
 }
 
-/// An I/O handle powered by the networking driver.
-///
-/// This handle wraps an I/O event source and exposes a "futurized" interface on top of it,
-/// implementing traits `AsyncRead` and `AsyncWrite`.
-pub(crate) struct Watcher<T: Evented> {
-    /// Data associated with the I/O handle.
+/// An async-friendly handle wrapping a `zmq::Socket` registered with the reactor.
+pub(crate) struct ZmqSocket {
+    /// Reactor entry. Field order matters: declared before `socket` so that
+    /// even if the explicit `Drop` is somehow skipped, deregistration logic
+    /// has a chance to observe the still-open SOCKET. The contract is that
+    /// `Drop::drop` runs `deregister` before `socket` is dropped.
     entry: Arc<Entry>,
 
-    /// The I/O event source.
-    source: Option<T>,
+    /// The underlying `zmq::Socket`. Dropped after `entry` per Rust's field
+    /// drop order, which closes the SOCKET only after deregistration.
+    socket: zmq::Socket,
 }
 
-impl<T: Evented> Watcher<T> {
-    /// Creates a new I/O handle.
-    ///
-    /// The provided I/O event source will be kept registered inside the reactor's poller for the
-    /// lifetime of the returned I/O handle.
-    pub(crate) fn new(source: T) -> Watcher<T> {
-        Watcher {
-            entry: REACTOR
-                .register(&source)
-                .expect("cannot register an I/O event source"),
-            source: Some(source),
-        }
+impl ZmqSocket {
+    /// Wrap a `zmq::Socket` and register it with the global reactor.
+    pub(crate) fn new(socket: zmq::Socket) -> Self {
+        // `zmq-0.10`'s `get_fd()` returns `RawFd` on every platform (the
+        // macro yields `ZMQ_FD as RawFd`). On Windows we cast to `RawSocket`
+        // for use with `BorrowedSocket`/`Poller` — mirrors what
+        // `zmq::Socket`'s `AsRawSocket` impl does.
+        let fd = socket.get_fd().expect("zmq socket has no fd");
+        #[cfg(unix)]
+        let raw: RawHandle = fd;
+        #[cfg(windows)]
+        let raw: RawHandle = fd as RawSocket;
+
+        // SAFETY: `ZmqSocket::Drop` calls `Reactor::deregister` BEFORE
+        // `zmq::Socket` drops (which closes the SOCKET), upholding the
+        // contract on `Poller::add`.
+        #[allow(unsafe_code)]
+        let entry = unsafe { Reactor::get().register(raw) }
+            .expect("cannot register zmq socket with reactor");
+
+        Self { entry, socket }
     }
 
-    /// Returns a reference to the inner I/O event source.
-    pub(crate) fn get_ref(&self) -> &T {
-        self.source.as_ref().unwrap()
+    /// Returns a reference to the inner `zmq::Socket`.
+    pub(crate) fn get_ref(&self) -> &zmq::Socket {
+        &self.socket
     }
 
     /// Polls the inner I/O source for a non-blocking read operation.
@@ -229,10 +257,10 @@ impl<T: Evented> Watcher<T> {
         mut f: F,
     ) -> Poll<io::Result<R>>
     where
-        F: FnMut(&'a T) -> io::Result<R>,
+        F: FnMut(&'a zmq::Socket) -> io::Result<R>,
     {
         // If the operation isn't blocked, return its result.
-        match f(self.source.as_ref().unwrap()) {
+        match f(&self.socket) {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             res => return Poll::Ready(res),
         }
@@ -241,7 +269,7 @@ impl<T: Evented> Watcher<T> {
         let mut readers = self.entry.readers.lock().unwrap();
 
         // Try running the operation again.
-        match f(self.source.as_ref().unwrap()) {
+        match f(&self.socket) {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             res => return Poll::Ready(res),
         }
@@ -266,10 +294,10 @@ impl<T: Evented> Watcher<T> {
         mut f: F,
     ) -> Poll<io::Result<R>>
     where
-        F: FnMut(&'a T) -> io::Result<R>,
+        F: FnMut(&'a zmq::Socket) -> io::Result<R>,
     {
         // If the operation isn't blocked, return its result.
-        match f(self.source.as_ref().unwrap()) {
+        match f(&self.socket) {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             res => return Poll::Ready(res),
         }
@@ -278,7 +306,7 @@ impl<T: Evented> Watcher<T> {
         let mut writers = self.entry.writers.lock().unwrap();
 
         // Try running the operation again.
-        match f(self.source.as_ref().unwrap()) {
+        match f(&self.socket) {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             res => return Poll::Ready(res),
         }
@@ -329,59 +357,18 @@ impl<T: Evented> Watcher<T> {
         }
         Poll::Pending
     }
-
-    /// Deregisters and returns the inner I/O source.
-    ///
-    /// This method is typically used to convert `Watcher`s to raw file descriptors/handles.
-    #[allow(dead_code)]
-    pub(crate) fn into_inner(mut self) -> T {
-        let source = self.source.take().unwrap();
-        REACTOR
-            .deregister(&source, &self.entry)
-            .expect("cannot deregister I/O event source");
-        source
-    }
 }
 
-impl<T: Evented> Drop for Watcher<T> {
+impl Drop for ZmqSocket {
     fn drop(&mut self) {
-        if let Some(ref source) = self.source {
-            REACTOR
-                .deregister(source, &self.entry)
-                .expect("cannot deregister I/O event source");
-        }
+        // Deregister BEFORE `zmq::Socket` drops (which closes the SOCKET).
+        // `main_loop` and `Drop` both lock `entries`, so they serialize.
+        let _ = Reactor::get().deregister(&self.entry);
     }
 }
 
-impl<T: Evented + fmt::Debug> fmt::Debug for Watcher<T> {
+impl fmt::Debug for ZmqSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Watcher")
-            .field("entry", &self.entry)
-            .field("source", &self.source)
-            .finish()
+        f.debug_struct("ZmqSocket").field("entry", &self.entry).finish()
     }
-}
-
-/// Returns a mask containing flags that interest tasks reading from I/O handles.
-#[inline]
-fn reader_interests() -> mio::Ready {
-    mio::Ready::all() - mio::Ready::writable()
-}
-
-/// Returns a mask containing flags that interest tasks writing into I/O handles.
-#[inline]
-fn writer_interests() -> mio::Ready {
-    mio::Ready::writable() | hup()
-}
-
-/// Returns a flag containing the hangup status.
-#[inline]
-fn hup() -> mio::Ready {
-    #[cfg(unix)]
-    let ready = mio::unix::UnixReady::hup().into();
-
-    #[cfg(not(unix))]
-    let ready = mio::Ready::empty();
-
-    ready
 }

@@ -1,9 +1,8 @@
 //! Socket type registered in async-std reactor
-pub(crate) mod evented;
 mod watcher;
 
 use crate::socket::{Multipart, MultipartIter};
-pub(crate) use watcher::Watcher;
+pub(crate) use watcher::ZmqSocket;
 
 use futures::ready;
 use std::io::{self, ErrorKind};
@@ -15,8 +14,6 @@ pub trait AsRawSocket {
     /// Method to get the raw zmq socket reference if users need to use it directly.
     fn as_socket(&self) -> &zmq::Socket;
 }
-
-pub(crate) type ZmqSocket = Watcher<evented::ZmqSocket>;
 
 impl ZmqSocket {
     fn poll_event(&self, event: zmq::PollEvents) -> Result<(), io::Error> {
@@ -75,12 +72,12 @@ impl ZmqSocket {
 
 impl From<zmq::Socket> for ZmqSocket {
     fn from(socket: zmq::Socket) -> Self {
-        Watcher::new(evented::ZmqSocket(socket))
+        ZmqSocket::new(socket)
     }
 }
 
 impl AsRawSocket for ZmqSocket {
     fn as_socket(&self) -> &zmq::Socket {
-        &self.get_ref().0
+        self.get_ref()
     }
 }
