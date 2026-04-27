@@ -4,7 +4,7 @@ use async_zmq::{reply, request, Message, Result};
 
 #[async_std::test]
 async fn publish_subscribe_message() -> Result<()> {
-    let uri = "tcp://0.0.0.0:5555";
+    let uri = "tcp://127.0.0.1:5555";
     let request = request(uri)?.connect()?;
     let reply = reply(uri)?.bind()?;
     let request_message = "Hello";

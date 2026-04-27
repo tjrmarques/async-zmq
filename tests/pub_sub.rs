@@ -5,7 +5,7 @@ use async_zmq::{publish, subscribe, Multipart, Result, SinkExt, StreamExt};
 
 #[async_std::test]
 async fn publish_subscribe_message() -> Result<()> {
-    let uri = "tcp://0.0.0.0:5555";
+    let uri = "tcp://127.0.0.1:5555";
     let mut publish = publish(uri)?.bind()?;
     let mut subscribe = subscribe(uri)?.connect()?;
     let topic = "Topic";
