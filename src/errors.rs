@@ -86,14 +86,14 @@ impl From<zmq::Error> for SocketError {
 /// but do not need to be handled by users of this crate:
 ///
 ///  * `EAGAIN` - this crate will automatically retry if this error code is
-///     produced
+///    produced
 ///  * `ENOTSUP` - unsupported operations are prevented by the design of this
-///     crate
+///    crate
 ///  * `EINVAL` - multipart messages are not yet supported
 ///  * `ENOTSOCK` - the design of this crate prevents sending messages on an
-///     invalid socket
+///    invalid socket
 ///  * `EFSM` - this applies only to REP/REQ sockets which have their own error
-///     type
+///    type
 #[derive(Clone, Copy, Debug, Error)]
 pub enum SendError {
     /// The ØMQ context associated with the specified socket was terminated.
@@ -169,14 +169,14 @@ impl From<zmq::Error> for SendError {
 /// but do not need to be handled by users of this crate:
 ///
 ///  * `EAGAIN` - this crate will automatically retry if this error code is
-///     produced
+///    produced
 ///  * `ENOTSUP` - unsupported operations are prevented by the design of this
-///     crate
+///    crate
 ///  * `EINVAL` - multipart messages are not yet supported
 ///  * `ENOTSOCK` - the design of this crate prevents sending messages on an
-///     invalid socket
+///    invalid socket
 ///  * `EFSM` - this applies only to REP/REQ sockets which have their own error
-///     type
+///    type
 #[derive(Clone, Copy, Debug, Error)]
 pub enum RecvError {
     /// The ØMQ context associated with the specified socket was terminated.
@@ -238,12 +238,12 @@ impl From<zmq::Error> for RecvError {
 /// but do not need to be handled by users of this crate:
 ///
 ///  * `EAGAIN` - this crate will automatically retry if this error code is
-///     produced
+///    produced
 ///  * `ENOTSUP` - unsupported operations are prevented by the design of this
-///     crate
+///    crate
 ///  * `EINVAL` - multipart messages are not yet supported
 ///  * `ENOTSOCK` - the design of this crate prevents sending messages on an
-///     invalid socket
+///    invalid socket
 #[derive(Clone, Copy, Debug, Error)]
 pub enum RequestReplyError {
     /// The socket was in the incorrect state for the operation.
@@ -324,7 +324,7 @@ impl From<zmq::Error> for RequestReplyError {
 ///
 ///  * `EINVAL` - the option name is always correct
 ///  * `ENOTSOCK` - the design of this crate prevents sending messages on an
-///     invalid socket
+///    invalid socket
 #[derive(Clone, Copy, Debug, Error)]
 pub enum SubscribeError {
     /// The ØMQ context associated with the specified socket was terminated.
